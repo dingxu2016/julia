@@ -19,8 +19,134 @@ typedef struct {
     jl_module_t *module; // context for globals
     jl_value_t **locals; // slots for holding local slots and ssavalues
     jl_svec_t *sparam_vals; // method static parameters, if eval-ing a method body
+    size_t ip; // Points to the currently-evaluating statement
     int preevaluation; // use special rules for pre-evaluating expressions
 } interpreter_state;
+
+// Backtrace support;
+#ifdef _OS_LINUX_
+extern uintptr_t __start_jl_interpreter_frame_val;
+uintptr_t __start_jl_interpreter_frame = (uintptr_t)&__start_jl_interpreter_frame_val;
+extern uintptr_t __stop_jl_interpreter_frame_val;
+uintptr_t __stop_jl_interpreter_frame = (uintptr_t)&__stop_jl_interpreter_frame_val;
+
+#define SECT_INTERP JL_SECTION("jl_interpreter_frame_val")
+
+#elif defined(_OS_DARWIN_)
+extern uintptr_t __start_jl_interpreter_frame_val __asm("section$start$__TEXT$__jif");
+uintptr_t __start_jl_interpreter_frame = (uintptr_t)&__start_jl_interpreter_frame_val;
+extern uintptr_t __stop_jl_interpreter_frame_val __asm("section$end$__TEXT$__jif");
+uintptr_t __stop_jl_interpreter_frame = (uintptr_t)&__stop_jl_interpreter_frame_val;
+
+#define SECT_INTERP JL_SECTION("__TEXT,__jif")
+#else
+#define SECT_INTERP
+#define NO_INTERP_BT
+#warning "Interpreter backtraces not implemented for this platform"
+#endif
+
+
+// This function is special. The unwinder looks for this function to find interpreter
+// stack frames.
+#ifdef _CPU_X86_64_
+
+size_t STACK_PADDING = 8;
+
+asm(
+#if defined(_OS_LINUX_)
+#define MANGLE(x) x
+    ".section .text.jeif\n"
+    ".p2align 4,0x90\n"
+    ".global enter_interpreter_frame\n"
+    ".type enter_interpreter_frame,@function\n"
+#elif defined(_OS_DARWIN_)
+#define MANGLE(x) "_" x
+    ".section __TEXT,__text,regular,pure_instructions\n"
+    ".globl _enter_interpreter_frame\n"
+#endif
+    MANGLE("enter_interpreter_frame") ":\n"
+    ".cfi_startproc\n"
+    // sizeof(struct interpreter_state) is 44, but we need to be 8 byte aligned,
+    // so subtract 48. For compact unwind info, we need to only have one subq,
+    // so combine in the stack realignment for a total of 56 btes.
+    "\tsubq $56, %rsp\n"
+    ".cfi_def_cfa_offset 64\n"
+    "\tmovq %rdi, %rax\n"
+    "\tleaq 8(%rsp), %rdi\n"
+    // Zero out the src field
+    "\tmovq $0, 8(%rsp)\n"
+    // The L here conviences the OS X linker not to terminate the unwind info early
+    "Lenter_interpreter_frame_start_val:\n"
+    "\tcallq *%rax\n"
+    "Lenter_interpreter_frame_end_val:\n"
+    "\taddq $56, %rsp\n"
+#ifndef _OS_DARWIN_
+    // Somehow this throws off compact unwind info on OS X
+    ".cfi_def_cfa_offset 8\n"
+#endif
+    "\tretq\n"
+    ".cfi_endproc\n"
+    ".previous\n");
+
+void *NOINLINE enter_interpreter_frame2(void *(*callback)(interpreter_state *, void *), void *arg) {
+    interpreter_state state = {};
+    return callback(&state, arg);
+}
+
+extern void *enter_interpreter_frame(void *(*callback)(interpreter_state *, void *), void *arg);
+extern uintptr_t enter_interpreter_frame_start_val asm("Lenter_interpreter_frame_start_val");
+extern uintptr_t enter_interpreter_frame_end_val asm("Lenter_interpreter_frame_end_val");
+uintptr_t enter_interpreter_frame_start = (uintptr_t)&enter_interpreter_frame_start_val;
+uintptr_t enter_interpreter_frame_end = (uintptr_t)&enter_interpreter_frame_end_val;
+
+// If this fails, update the code above
+static_assert(sizeof(interpreter_state) <= 48, "Update assembly code above");
+
+#else
+#warning "Interpreter backtraces not implemented for this platform"
+#define NO_INTERP_BT
+#endif
+
+#ifndef NO_INTERP_BT
+JL_DLLEXPORT int jl_is_interpreter_frame(uintptr_t ip)
+{
+    return __start_jl_interpreter_frame <= ip && ip <= __stop_jl_interpreter_frame;
+}
+
+JL_DLLEXPORT int jl_is_enter_interpreter_frame(uintptr_t ip)
+{
+    return enter_interpreter_frame_start <= ip && ip <= enter_interpreter_frame_end;
+}
+
+JL_DLLEXPORT size_t jl_capture_interp_frame(uintptr_t *data, uintptr_t sp, size_t space_remaining)
+{
+    interpreter_state *s = (interpreter_state *)(sp+STACK_PADDING);
+    if (space_remaining <= 1 || s->src == 0)
+        return 0;
+    // Sentinel value to indicate an interpreter frame
+    data[0] = (uintptr_t)-1;
+    data[1] = (uintptr_t)s->src;
+    data[2] = (uintptr_t)s->ip;
+    return 2;
+}
+#else
+JL_DLLEXPORT int jl_is_interpreter_frame(uintptr_t ip)
+{
+    return 0;
+}
+
+JL_DLLEXPORT int jl_is_enter_interpreter_frame(uintptr_t ip)
+{
+    return 0;
+}
+
+JL_DLLEXPORT size_t jl_capture_interp_frame(uintptr_t *data, uintptr_t sp, size_t space_remaining)
+{
+    return 0;
+}
+#endif
+
+
 
 static jl_value_t *eval(jl_value_t *e, interpreter_state *s);
 static jl_value_t *eval_body(jl_array_t *stmts, interpreter_state *s, int start, int toplevel);
@@ -31,23 +157,29 @@ int jl_is_toplevel_only_expr(jl_value_t *e);
 // deprecated: do not use this method in new code
 // it uses special scoping / evaluation / error rules
 // which should instead be handled in lowering
-jl_value_t *jl_interpret_toplevel_expr_in(jl_module_t *m, jl_value_t *e,
-                                          jl_code_info_t *src,
-                                          jl_svec_t *sparam_vals)
+struct interpret_toplevel_expr_in_args {
+    jl_module_t *m;
+    jl_value_t *e;
+    jl_code_info_t *src;
+    jl_svec_t *sparam_vals;
+};
+
+SECT_INTERP void *jl_interpret_toplevel_expr_in_callback(interpreter_state *s, void *vargs)
 {
+    struct interpret_toplevel_expr_in_args *args =
+        (struct interpret_toplevel_expr_in_args*)vargs;
     jl_ptls_t ptls = jl_get_ptls_states();
     jl_value_t *v=NULL;
     jl_module_t *last_m = ptls->current_module;
     jl_module_t *task_last_m = ptls->current_task->current_module;
-    interpreter_state s = {};
-    s.src = src;
-    s.module = m;
-    s.sparam_vals = sparam_vals;
-    s.preevaluation = (sparam_vals != NULL);
+    s->src = args->src;
+    s->module = args->m;
+    s->sparam_vals = args->sparam_vals;
+    s->preevaluation = (s->sparam_vals != NULL);
 
     JL_TRY {
-        ptls->current_task->current_module = ptls->current_module = m;
-        v = eval(e, &s);
+        ptls->current_task->current_module = ptls->current_module = args->m;
+        v = eval(args->e, s);
     }
     JL_CATCH {
         ptls->current_module = last_m;
@@ -57,10 +189,21 @@ jl_value_t *jl_interpret_toplevel_expr_in(jl_module_t *m, jl_value_t *e,
     ptls->current_module = last_m;
     ptls->current_task->current_module = task_last_m;
     assert(v);
-    return v;
+    return (void*)v;
 }
 
-static jl_value_t *do_call(jl_value_t **args, size_t nargs, interpreter_state *s)
+SECT_INTERP jl_value_t *jl_interpret_toplevel_expr_in(jl_module_t *m, jl_value_t *e, jl_code_info_t *src, jl_svec_t *sparam_vals)
+{
+    struct interpret_toplevel_expr_in_args args = {
+        .m = m,
+        .e = e,
+        .src = src,
+        .sparam_vals = sparam_vals
+    };
+    return (jl_value_t *)enter_interpreter_frame(jl_interpret_toplevel_expr_in_callback, (void*)&args);
+}
+
+SECT_INTERP static jl_value_t *do_call(jl_value_t **args, size_t nargs, interpreter_state *s)
 {
     jl_value_t **argv;
     JL_GC_PUSHARGS(argv, nargs);
@@ -72,7 +215,7 @@ static jl_value_t *do_call(jl_value_t **args, size_t nargs, interpreter_state *s
     return result;
 }
 
-static jl_value_t *do_invoke(jl_value_t **args, size_t nargs, interpreter_state *s)
+SECT_INTERP static jl_value_t *do_invoke(jl_value_t **args, size_t nargs, interpreter_state *s)
 {
     jl_value_t **argv;
     JL_GC_PUSHARGS(argv, nargs - 1);
@@ -86,7 +229,7 @@ static jl_value_t *do_invoke(jl_value_t **args, size_t nargs, interpreter_state 
     return result;
 }
 
-jl_value_t *jl_eval_global_var(jl_module_t *m, jl_sym_t *e)
+SECT_INTERP jl_value_t *jl_eval_global_var(jl_module_t *m, jl_sym_t *e)
 {
     jl_value_t *v = jl_get_global(m, e);
     if (v == NULL)
@@ -98,7 +241,7 @@ extern int jl_boot_file_loaded;
 extern int inside_typedef;
 
 // this is a heuristic for allowing "redefining" a type to something identical
-static int equiv_type(jl_datatype_t *dta, jl_datatype_t *dtb)
+SECT_INTERP static int equiv_type(jl_datatype_t *dta, jl_datatype_t *dtb)
 {
     if (!(jl_typeof(dta) == jl_typeof(dtb) &&
           dta->name->name == dtb->name->name &&
@@ -157,7 +300,7 @@ static int equiv_type(jl_datatype_t *dta, jl_datatype_t *dtb)
     return 0;
 }
 
-static void check_can_assign_type(jl_binding_t *b, jl_value_t *rhs)
+SECT_INTERP static void check_can_assign_type(jl_binding_t *b, jl_value_t *rhs)
 {
     if (b->constp && b->value != NULL && jl_typeof(b->value) != jl_typeof(rhs))
         jl_errorf("invalid redefinition of constant %s",
@@ -167,7 +310,7 @@ static void check_can_assign_type(jl_binding_t *b, jl_value_t *rhs)
 void jl_reinstantiate_inner_types(jl_datatype_t *t);
 void jl_reset_instantiate_inner_types(jl_datatype_t *t);
 
-void jl_set_datatype_super(jl_datatype_t *tt, jl_value_t *super)
+SECT_INTERP void jl_set_datatype_super(jl_datatype_t *tt, jl_value_t *super)
 {
     if (!jl_is_datatype(super) || !jl_is_abstracttype(super) ||
         tt->name == ((jl_datatype_t*)super)->name ||
@@ -182,17 +325,17 @@ void jl_set_datatype_super(jl_datatype_t *tt, jl_value_t *super)
     jl_gc_wb(tt, tt->super);
 }
 
-static int jl_source_nslots(jl_code_info_t *src)
+SECT_INTERP static int jl_source_nslots(jl_code_info_t *src)
 {
     return jl_array_len(src->slotflags);
 }
 
-static int jl_source_nssavalues(jl_code_info_t *src)
+SECT_INTERP static int jl_source_nssavalues(jl_code_info_t *src)
 {
     return jl_is_long(src->ssavaluetypes) ? jl_unbox_long(src->ssavaluetypes) : jl_array_len(src->ssavaluetypes);
 }
 
-static jl_value_t *eval(jl_value_t *e, interpreter_state *s)
+SECT_INTERP static jl_value_t *eval(jl_value_t *e, interpreter_state *s)
 {
     jl_ptls_t ptls = jl_get_ptls_states();
     jl_code_info_t *src = s->src;
@@ -516,30 +659,42 @@ static jl_value_t *eval(jl_value_t *e, interpreter_state *s)
     abort();
 }
 
-jl_value_t *jl_toplevel_eval_body(jl_module_t *m, jl_array_t *stmts)
+struct jl_toplevel_eval_body_args {
+    jl_module_t *m;
+    jl_array_t *stmts;
+};
+
+SECT_INTERP void *jl_toplevel_eval_body_callback(interpreter_state *s, void *vargs)
 {
     size_t last_age = jl_get_ptls_states()->world_age;
-    interpreter_state s = {};
-    s.module = m;
-    jl_value_t *ret = eval_body(stmts, &s, 0, 1);
+    struct jl_toplevel_eval_body_args *args =
+        (struct jl_toplevel_eval_body_args*)vargs;
+    s->module = args->m;
+    jl_value_t *ret = eval_body(args->stmts, s, 0, 1);
     jl_get_ptls_states()->world_age = last_age;
     return ret;
 }
 
-static jl_value_t *eval_body(jl_array_t *stmts, interpreter_state *s, int start, int toplevel)
+SECT_INTERP jl_value_t *jl_toplevel_eval_body(jl_module_t *m, jl_array_t *stmts)
+{
+    struct jl_toplevel_eval_body_args args = { .m = m, .stmts = stmts };
+    return (jl_value_t*)enter_interpreter_frame(jl_toplevel_eval_body_callback, &args);
+}
+
+SECT_INTERP static jl_value_t *eval_body(jl_array_t *stmts, interpreter_state *s, int start, int toplevel)
 {
     jl_handler_t __eh;
-    size_t i = start;
+    s->ip = start;
     size_t ns = jl_array_len(stmts);
 
     while (1) {
-        if (i >= ns)
+        if (s->ip >= ns)
             jl_error("`body` expression must terminate in `return`. Use `block` instead.");
         if (toplevel)
             jl_get_ptls_states()->world_age = jl_world_counter;
-        jl_value_t *stmt = jl_array_ptr_ref(stmts, i);
+        jl_value_t *stmt = jl_array_ptr_ref(stmts, s->ip);
         if (jl_is_gotonode(stmt)) {
-            i = jl_gotonode_label(stmt) - 1;
+            s->ip = jl_gotonode_label(stmt) - 1;
             continue;
         }
         else if (jl_is_expr(stmt)) {
@@ -581,24 +736,29 @@ static jl_value_t *eval_body(jl_array_t *stmts, interpreter_state *s, int start,
             else if (head == goto_ifnot_sym) {
                 jl_value_t *cond = eval(jl_exprarg(stmt, 0), s);
                 if (cond == jl_false) {
-                    i = jl_unbox_long(jl_exprarg(stmt, 1)) - 1;
+                    s->ip = jl_unbox_long(jl_exprarg(stmt, 1)) - 1;
                     continue;
                 }
                 else if (cond != jl_true) {
                     jl_type_error_rt("toplevel", "if", (jl_value_t*)jl_bool_type, cond);
                 }
             }
+            else if (head == line_sym) {
+                if (toplevel)
+                    jl_lineno = jl_unbox_long(jl_exprarg(stmt, 0));
+                // TODO: interpreted function line numbers
+            }
             else if (head == enter_sym) {
                 jl_enter_handler(&__eh);
                 if (!jl_setjmp(__eh.eh_ctx,1)) {
-                    return eval_body(stmts, s, i + 1, toplevel);
+                    return eval_body(stmts, s, s->ip + 1, toplevel);
                 }
                 else {
 #ifdef _OS_WINDOWS_
                     if (jl_get_ptls_states()->exception_in_transit == jl_stackovf_exception)
                         _resetstkoflw();
 #endif
-                    i = jl_unbox_long(jl_exprarg(stmt, 0)) - 1;
+                    s->ip = jl_unbox_long(jl_exprarg(stmt, 0)) - 1;
                     continue;
                 }
             }
@@ -628,32 +788,38 @@ static jl_value_t *eval_body(jl_array_t *stmts, interpreter_state *s, int start,
         else {
             eval(stmt, s);
         }
-        i++;
+        s->ip++;
     }
     assert(0);
     return NULL;
 }
 
-jl_value_t *jl_interpret_call(jl_method_instance_t *lam, jl_value_t **args, uint32_t nargs)
+struct jl_interpret_call_args {
+    jl_method_instance_t *lam;
+    jl_value_t **args;
+    uint32_t nargs;
+};
+
+SECT_INTERP void *jl_interpret_call_callback(interpreter_state *s, void *vargs)
 {
-    if (lam->jlcall_api == 2)
-        return lam->inferred_const;
-    jl_code_info_t *src = (jl_code_info_t*)lam->inferred;
+    struct jl_interpret_call_args *args =
+        (struct jl_interpret_call_args *)vargs;
+    jl_code_info_t *src = (jl_code_info_t*)args->lam->inferred;
     if (!src || (jl_value_t*)src == jl_nothing) {
-        if (lam->def.method->source) {
-            src = (jl_code_info_t*)lam->def.method->source;
+        if (args->lam->def.method->source) {
+            src = (jl_code_info_t*)args->lam->def.method->source;
         }
         else {
-            assert(lam->def.method->generator);
-            src = jl_code_for_staged(lam);
-            lam->inferred = (jl_value_t*)src;
-            jl_gc_wb(lam, src);
+            assert(args->lam->def.method->generator);
+            src = jl_code_for_staged(args->lam);
+            args->lam->inferred = (jl_value_t*)src;
+            jl_gc_wb(args->lam, src);
         }
     }
     if (src && (jl_value_t*)src != jl_nothing) {
-        src = jl_uncompress_ast(lam->def.method, (jl_array_t*)src);
-        lam->inferred = (jl_value_t*)src;
-        jl_gc_wb(lam, src);
+        src = jl_uncompress_ast(args->lam->def.method, (jl_array_t*)src);
+        args->lam->inferred = (jl_value_t*)src;
+        jl_gc_wb(args->lam, src);
     }
     if (!src || !jl_is_code_info(src)) {
         jl_error("source missing for method called in interpreter");
@@ -665,39 +831,56 @@ jl_value_t *jl_interpret_call(jl_method_instance_t *lam, jl_value_t **args, uint
     JL_GC_PUSHARGS(locals, jl_source_nslots(src) + jl_source_nssavalues(src) + 2);
     locals[0] = (jl_value_t*)src;
     locals[1] = (jl_value_t*)stmts;
-    interpreter_state s = {};
-    s.src = src;
-    s.module = lam->def.method->module;
-    s.locals = locals + 2;
-    s.sparam_vals = lam->sparam_vals;
+    s->src = src;
+    s->module = args->lam->def.method->module;
+    s->locals = locals + 2;
+    s->sparam_vals = args->lam->sparam_vals;
     size_t i;
-    for (i = 0; i < lam->def.method->nargs; i++) {
-        if (lam->def.method->isva && i == lam->def.method->nargs - 1)
-            s.locals[i] = jl_f_tuple(NULL, &args[i], nargs - i);
+    for (i = 0; i < args->lam->def.method->nargs; i++) {
+        if (args->lam->def.method->isva && i == args->lam->def.method->nargs - 1)
+            s->locals[i] = jl_f_tuple(NULL, &args->args[i], args->nargs - i);
         else
-            s.locals[i] = args[i];
+            s->locals[i] = args->args[i];
     }
-    jl_value_t *r = eval_body(stmts, &s, 0, 0);
+    jl_value_t *r = eval_body(stmts, s, 0, 0);
     JL_GC_POP();
-    return r;
+    return (void*)r;
 }
 
-jl_value_t *jl_interpret_toplevel_thunk(jl_module_t *m, jl_code_info_t *src)
+SECT_INTERP jl_value_t *jl_interpret_call(jl_method_instance_t *lam, jl_value_t **args, uint32_t nargs)
 {
-    jl_array_t *stmts = src->code;
+    if (lam->jlcall_api == 2)
+        return lam->inferred_const;
+    struct jl_interpret_call_args callback_args = {.lam = lam, .args = args, .nargs = nargs};
+    return (jl_value_t*)enter_interpreter_frame(jl_interpret_call_callback, (void *)&callback_args);
+}
+
+struct jl_interpret_toplevel_thunk_args {
+    jl_module_t *m;
+    jl_code_info_t *src;
+};
+SECT_INTERP void *jl_interpret_toplevel_thunk_callback(interpreter_state *s, void *vargs) {
+    struct jl_interpret_toplevel_thunk_args *args =
+        (struct jl_interpret_toplevel_thunk_args*)vargs;
+    jl_array_t *stmts = args->src->code;
     assert(jl_typeis(stmts, jl_array_any_type));
     jl_value_t **locals;
-    JL_GC_PUSHARGS(locals, jl_source_nslots(src) + jl_source_nssavalues(src));
-    interpreter_state s = {};
-    s.src = src;
-    s.locals = locals;
-    s.module = m;
-    s.sparam_vals = jl_emptysvec;
+    JL_GC_PUSHARGS(locals, jl_source_nslots(args->src) + jl_source_nssavalues(args->src));
+    s->src = args->src;
+    s->locals = locals;
+    s->module = args->m;
+    s->sparam_vals = jl_emptysvec;
     size_t last_age = jl_get_ptls_states()->world_age;
-    jl_value_t *r = eval_body(stmts, &s, 0, 1);
+    jl_value_t *r = eval_body(stmts, s, 0, 1);
     jl_get_ptls_states()->world_age = last_age;
     JL_GC_POP();
-    return r;
+    return (void*)r;
+}
+
+SECT_INTERP jl_value_t *jl_interpret_toplevel_thunk(jl_module_t *m, jl_code_info_t *src)
+{
+    struct jl_interpret_toplevel_thunk_args args = {.m = m, .src = src};
+    return (jl_value_t *)enter_interpreter_frame(jl_interpret_toplevel_thunk_callback, (void*)&args);
 }
 
 #ifdef __cplusplus

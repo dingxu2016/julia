@@ -241,9 +241,10 @@ JL_DLLEXPORT jl_value_t *jl_apply_with_saved_exception_state(jl_value_t **args, 
     jl_ptls_t ptls = jl_get_ptls_states();
     jl_value_t *exc = ptls->exception_in_transit;
     jl_array_t *bt = NULL;
-    JL_GC_PUSH2(&exc, &bt);
+    jl_array_t *bt2 = NULL;
+    JL_GC_PUSH3(&exc, &bt, &bt2);
     if (ptls->bt_size > 0)
-        bt = (jl_array_t*)jl_get_backtrace();
+        jl_get_backtrace(&bt, &bt2);
     jl_value_t *v;
     JL_TRY {
         v = jl_apply(args, nargs);
@@ -259,6 +260,7 @@ JL_DLLEXPORT jl_value_t *jl_apply_with_saved_exception_state(jl_value_t **args, 
     }
     ptls->exception_in_transit = exc;
     if (bt != NULL) {
+        // This is sufficient because bt2 roots the gc-managed values
         ptls->bt_size = jl_array_len(bt);
         memcpy(ptls->bt_data, bt->data, ptls->bt_size * sizeof(void*));
     }
