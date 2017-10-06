@@ -234,7 +234,8 @@
       (ssavalue? e)))
 
 (define (simple-atom? x)
-  (or (number? x) (string? x) (char? x) (eq? x 'true) (eq? x 'false)))
+  (or (number? x) (string? x) (char? x) (eq? x 'true) (eq? x 'false)
+      (ssavalue? x) (eq? (typeof x) 'julia_value)))
 
 ;; identify some expressions that are safe to repeat
 (define (effect-free? e)
