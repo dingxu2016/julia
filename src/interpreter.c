@@ -24,7 +24,7 @@ typedef struct {
 } interpreter_state;
 
 // Backtrace support;
-#ifdef _OS_LINUX_
+#if defined(_OS_LINUX_) || defined(_OS_WINDOWS_)
 extern uintptr_t __start_jl_interpreter_frame_val;
 uintptr_t __start_jl_interpreter_frame = (uintptr_t)&__start_jl_interpreter_frame_val;
 extern uintptr_t __stop_jl_interpreter_frame_val;
@@ -50,15 +50,23 @@ uintptr_t __stop_jl_interpreter_frame = (uintptr_t)&__stop_jl_interpreter_frame_
 // stack frames.
 #ifdef _CPU_X86_64_
 
+#ifdef _OS_WINDOWS_
+size_t STACK_PADDING = 40;
+#else
 size_t STACK_PADDING = 8;
+#endif
 
 asm(
 #if defined(_OS_LINUX_)
 #define MANGLE(x) x
-    ".section .text.jeif\n"
+    ".section .text\n"
     ".p2align 4,0x90\n"
     ".global enter_interpreter_frame\n"
     ".type enter_interpreter_frame,@function\n"
+#elif defined(_OS_WINDOWS_)
+#define MANGLE(x) x
+    ".text\n"
+    ".globl enter_interpreter_frame\n"
 #elif defined(_OS_DARWIN_)
 #define MANGLE(x) "_" x
     ".section __TEXT,__text,regular,pure_instructions\n"
@@ -68,17 +76,29 @@ asm(
     ".cfi_startproc\n"
     // sizeof(struct interpreter_state) is 44, but we need to be 8 byte aligned,
     // so subtract 48. For compact unwind info, we need to only have one subq,
-    // so combine in the stack realignment for a total of 56 btes.
+    // so combine in the stack realignment for a total of 56 bytes.
     "\tsubq $56, %rsp\n"
     ".cfi_def_cfa_offset 64\n"
-    "\tmovq %rdi, %rax\n"
-    "\tleaq 8(%rsp), %rdi\n"
+#ifdef _OS_WINDOWS_
+    "\tmovq %rcx, %rax\n"
+    "\tleaq 8(%rsp), %rcx\n"
+#else
+     "\tmovq %rdi, %rax\n"
+     "\tleaq 8(%rsp), %rdi\n"
+#endif
     // Zero out the src field
     "\tmovq $0, 8(%rsp)\n"
+#ifdef _OS_WINDOWS_
+    // Make space for the register parameter area
+    "\tsubq $32, %rsp\n"
+#endif
     // The L here conviences the OS X linker not to terminate the unwind info early
     "Lenter_interpreter_frame_start_val:\n"
     "\tcallq *%rax\n"
     "Lenter_interpreter_frame_end_val:\n"
+#ifdef _OS_WINDOWS_
+    "\taddq $32, %rsp\n"
+#endif
     "\taddq $56, %rsp\n"
 #ifndef _OS_DARWIN_
     // Somehow this throws off compact unwind info on OS X
@@ -86,7 +106,10 @@ asm(
 #endif
     "\tretq\n"
     ".cfi_endproc\n"
-    ".previous\n");
+#ifndef _OS_WINDOWS_
+    ".previous\n"
+#endif
+    );
 
 void *NOINLINE enter_interpreter_frame2(void *(*callback)(interpreter_state *, void *), void *arg) {
     interpreter_state state = {};
