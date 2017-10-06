@@ -23,153 +23,7 @@ typedef struct {
     int preevaluation; // use special rules for pre-evaluating expressions
 } interpreter_state;
 
-// Backtrace support;
-#if defined(_OS_LINUX_) || defined(_OS_WINDOWS_)
-extern uintptr_t __start_jl_interpreter_frame_val;
-uintptr_t __start_jl_interpreter_frame = (uintptr_t)&__start_jl_interpreter_frame_val;
-extern uintptr_t __stop_jl_interpreter_frame_val;
-uintptr_t __stop_jl_interpreter_frame = (uintptr_t)&__stop_jl_interpreter_frame_val;
-
-#define SECT_INTERP JL_SECTION("jl_interpreter_frame_val")
-
-#elif defined(_OS_DARWIN_)
-extern uintptr_t __start_jl_interpreter_frame_val __asm("section$start$__TEXT$__jif");
-uintptr_t __start_jl_interpreter_frame = (uintptr_t)&__start_jl_interpreter_frame_val;
-extern uintptr_t __stop_jl_interpreter_frame_val __asm("section$end$__TEXT$__jif");
-uintptr_t __stop_jl_interpreter_frame = (uintptr_t)&__stop_jl_interpreter_frame_val;
-
-#define SECT_INTERP JL_SECTION("__TEXT,__jif")
-#else
-#define SECT_INTERP
-#define NO_INTERP_BT
-#warning "Interpreter backtraces not implemented for this platform"
-#endif
-
-
-// This function is special. The unwinder looks for this function to find interpreter
-// stack frames.
-#ifdef _CPU_X86_64_
-
-#ifdef _OS_WINDOWS_
-size_t STACK_PADDING = 40;
-#else
-size_t STACK_PADDING = 8;
-#endif
-
-asm(
-#if defined(_OS_LINUX_)
-#define MANGLE(x) x
-    ".section .text\n"
-    ".p2align 4,0x90\n"
-    ".global enter_interpreter_frame\n"
-    ".type enter_interpreter_frame,@function\n"
-#elif defined(_OS_WINDOWS_)
-#define MANGLE(x) x
-    ".text\n"
-    ".globl enter_interpreter_frame\n"
-#elif defined(_OS_DARWIN_)
-#define MANGLE(x) "_" x
-    ".section __TEXT,__text,regular,pure_instructions\n"
-    ".globl _enter_interpreter_frame\n"
-#endif
-    MANGLE("enter_interpreter_frame") ":\n"
-    ".cfi_startproc\n"
-    // sizeof(struct interpreter_state) is 44, but we need to be 8 byte aligned,
-    // so subtract 48. For compact unwind info, we need to only have one subq,
-    // so combine in the stack realignment for a total of 56 bytes.
-    "\tsubq $56, %rsp\n"
-    ".cfi_def_cfa_offset 64\n"
-#ifdef _OS_WINDOWS_
-    "\tmovq %rcx, %rax\n"
-    "\tleaq 8(%rsp), %rcx\n"
-#else
-     "\tmovq %rdi, %rax\n"
-     "\tleaq 8(%rsp), %rdi\n"
-#endif
-    // Zero out the src field
-    "\tmovq $0, 8(%rsp)\n"
-#ifdef _OS_WINDOWS_
-    // Make space for the register parameter area
-    "\tsubq $32, %rsp\n"
-#endif
-    // The L here conviences the OS X linker not to terminate the unwind info early
-    "Lenter_interpreter_frame_start_val:\n"
-    "\tcallq *%rax\n"
-    "Lenter_interpreter_frame_end_val:\n"
-#ifdef _OS_WINDOWS_
-    "\taddq $32, %rsp\n"
-#endif
-    "\taddq $56, %rsp\n"
-#ifndef _OS_DARWIN_
-    // Somehow this throws off compact unwind info on OS X
-    ".cfi_def_cfa_offset 8\n"
-#endif
-    "\tretq\n"
-    ".cfi_endproc\n"
-#ifndef _OS_WINDOWS_
-    ".previous\n"
-#endif
-    );
-
-void *NOINLINE enter_interpreter_frame2(void *(*callback)(interpreter_state *, void *), void *arg) {
-    interpreter_state state = {};
-    return callback(&state, arg);
-}
-
-extern void *enter_interpreter_frame(void *(*callback)(interpreter_state *, void *), void *arg);
-extern uintptr_t enter_interpreter_frame_start_val asm("Lenter_interpreter_frame_start_val");
-extern uintptr_t enter_interpreter_frame_end_val asm("Lenter_interpreter_frame_end_val");
-uintptr_t enter_interpreter_frame_start = (uintptr_t)&enter_interpreter_frame_start_val;
-uintptr_t enter_interpreter_frame_end = (uintptr_t)&enter_interpreter_frame_end_val;
-
-// If this fails, update the code above
-static_assert(sizeof(interpreter_state) <= 48, "Update assembly code above");
-
-#else
-#warning "Interpreter backtraces not implemented for this platform"
-#define NO_INTERP_BT
-#endif
-
-#ifndef NO_INTERP_BT
-JL_DLLEXPORT int jl_is_interpreter_frame(uintptr_t ip)
-{
-    return __start_jl_interpreter_frame <= ip && ip <= __stop_jl_interpreter_frame;
-}
-
-JL_DLLEXPORT int jl_is_enter_interpreter_frame(uintptr_t ip)
-{
-    return enter_interpreter_frame_start <= ip && ip <= enter_interpreter_frame_end;
-}
-
-JL_DLLEXPORT size_t jl_capture_interp_frame(uintptr_t *data, uintptr_t sp, size_t space_remaining)
-{
-    interpreter_state *s = (interpreter_state *)(sp+STACK_PADDING);
-    if (space_remaining <= 1 || s->src == 0)
-        return 0;
-    // Sentinel value to indicate an interpreter frame
-    data[0] = (uintptr_t)-1;
-    data[1] = (uintptr_t)s->src;
-    data[2] = (uintptr_t)s->ip;
-    return 2;
-}
-#else
-JL_DLLEXPORT int jl_is_interpreter_frame(uintptr_t ip)
-{
-    return 0;
-}
-
-JL_DLLEXPORT int jl_is_enter_interpreter_frame(uintptr_t ip)
-{
-    return 0;
-}
-
-JL_DLLEXPORT size_t jl_capture_interp_frame(uintptr_t *data, uintptr_t sp, size_t space_remaining)
-{
-    return 0;
-}
-#endif
-
-
+#include "interpreter-stacktrace.c"
 
 static jl_value_t *eval(jl_value_t *e, interpreter_state *s);
 static jl_value_t *eval_body(jl_array_t *stmts, interpreter_state *s, int start, int toplevel);
@@ -187,7 +41,7 @@ struct interpret_toplevel_expr_in_args {
     jl_svec_t *sparam_vals;
 };
 
-SECT_INTERP void *jl_interpret_toplevel_expr_in_callback(interpreter_state *s, void *vargs)
+SECT_INTERP CALLBACK_ABI void *jl_interpret_toplevel_expr_in_callback(interpreter_state *s, void *vargs)
 {
     struct interpret_toplevel_expr_in_args *args =
         (struct interpret_toplevel_expr_in_args*)vargs;
@@ -687,7 +541,7 @@ struct jl_toplevel_eval_body_args {
     jl_array_t *stmts;
 };
 
-SECT_INTERP void *jl_toplevel_eval_body_callback(interpreter_state *s, void *vargs)
+SECT_INTERP CALLBACK_ABI void *jl_toplevel_eval_body_callback(interpreter_state *s, void *vargs)
 {
     size_t last_age = jl_get_ptls_states()->world_age;
     struct jl_toplevel_eval_body_args *args =
@@ -823,7 +677,7 @@ struct jl_interpret_call_args {
     uint32_t nargs;
 };
 
-SECT_INTERP void *jl_interpret_call_callback(interpreter_state *s, void *vargs)
+SECT_INTERP CALLBACK_ABI void *jl_interpret_call_callback(interpreter_state *s, void *vargs)
 {
     struct jl_interpret_call_args *args =
         (struct jl_interpret_call_args *)vargs;
@@ -882,7 +736,7 @@ struct jl_interpret_toplevel_thunk_args {
     jl_module_t *m;
     jl_code_info_t *src;
 };
-SECT_INTERP void *jl_interpret_toplevel_thunk_callback(interpreter_state *s, void *vargs) {
+SECT_INTERP CALLBACK_ABI void *jl_interpret_toplevel_thunk_callback(interpreter_state *s, void *vargs) {
     struct jl_interpret_toplevel_thunk_args *args =
         (struct jl_interpret_toplevel_thunk_args*)vargs;
     jl_array_t *stmts = args->src->code;
