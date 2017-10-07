@@ -188,7 +188,7 @@ Returns a stack trace in the form of a vector of `StackFrame`s. (By default stac
 doesn't return C functions, but this can be enabled.) When called without specifying a
 trace, `stacktrace` first calls `backtrace`.
 """
-function stacktrace(trace::Vector{Union{Base.InterpreterIP,Ptr{Void}}}, c_funcs::Bool=false)
+function stacktrace(trace::Vector{<:Union{Base.InterpreterIP,Ptr{Void}}}, c_funcs::Bool=false)
     stack = vcat(StackTrace(), map(lookup, trace)...)::StackTrace
 
     # Remove frames that come from C calls.
@@ -291,8 +291,8 @@ function from(frame::StackFrame, m::Module)
     finfo = frame.linfo
     result = false
 
-    if !isnull(finfo)
-        frame_m = get(finfo).def
+    if finfo isa Core.MethodInstance
+        frame_m = finfo.def
         isa(frame_m, Method) && (frame_m = frame_m.module)
         result = module_name(frame_m) === module_name(m)
     end
