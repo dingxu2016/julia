@@ -3,7 +3,7 @@
 // #include'd from interpreter.c
 
 // Backtrace support
-#if defined(_OS_LINUX_) || defined(_OS_WINDOWS_)
+#if defined(_OS_LINUX_) || defined(_OS_FREEBSD_) || defined(_OS_WINDOWS_)
 extern uintptr_t __start_jl_interpreter_frame_val;
 uintptr_t __start_jl_interpreter_frame = (uintptr_t)&__start_jl_interpreter_frame_val;
 extern uintptr_t __stop_jl_interpreter_frame_val;
@@ -12,12 +12,16 @@ uintptr_t __stop_jl_interpreter_frame = (uintptr_t)&__stop_jl_interpreter_frame_
 #define SECT_INTERP JL_SECTION("jl_interpreter_frame_val")
 #define MANGLE(x) x
 
-#ifdef _OS_LINUX
+#if defined(_OS_LINUX_) || defined(_OS_FREEBSD_)
 #define ASM_ENTRY                               \
     ".p2align 4,0x90\n"                         \
     ".global enter_interpreter_frame\n"         \
     ".type enter_interpreter_frame,@function\n"
+#if defined(_OS_LINUX_)
 #define ASM_END ".previous\n"
+#else
+#define ASM_END
+#endif
 #else
 #define ASM_ENTRY                               \
     ".text\n"                                   \
