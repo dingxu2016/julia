@@ -10,10 +10,15 @@ extern uintptr_t __stop_jl_interpreter_frame_val;
 uintptr_t __stop_jl_interpreter_frame = (uintptr_t)&__stop_jl_interpreter_frame_val;
 
 #define SECT_INTERP JL_SECTION("jl_interpreter_frame_val")
+#if defined(_CPU_X86_) && defined(_OS_WINDOWS)
+#define MANGLE(x) "@" x "@8"
+#else
 #define MANGLE(x) x
+#endif
 
 #if defined(_OS_LINUX_) || defined(_OS_FREEBSD_)
 #define ASM_ENTRY                               \
+    ".text\n"                                   \
     ".p2align 4,0x90\n"                         \
     ".global enter_interpreter_frame\n"         \
     ".type enter_interpreter_frame,@function\n"
