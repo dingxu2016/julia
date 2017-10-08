@@ -10,7 +10,7 @@ extern uintptr_t __stop_jl_interpreter_frame_val;
 uintptr_t __stop_jl_interpreter_frame = (uintptr_t)&__stop_jl_interpreter_frame_val;
 
 #define SECT_INTERP JL_SECTION("jl_interpreter_frame_val")
-#if defined(_CPU_X86_) && defined(_OS_WINDOWS)
+#if defined(_CPU_X86_) && defined(_OS_WINDOWS_)
 #define MANGLE(x) "@" x "@8"
 #else
 #define MANGLE(x) x
